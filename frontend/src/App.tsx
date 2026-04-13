@@ -22,7 +22,9 @@ type ChatMsg = {
 };
 
 // REMEMBER: Update this to your deployed backend URL when going live!
-const socket: Socket = io('http://localhost:4000', { autoConnect: false });
+const socket: Socket = io('https://guess-it-1a80.onrender.com', {
+	autoConnect: false,
+});
 
 export default function App() {
 	const [username, setUsername] = useState('');
