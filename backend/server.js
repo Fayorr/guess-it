@@ -8,7 +8,10 @@ const app = express();
 
 const allowedOrigins = [
 	'http://localhost:5173',
+	'http://localhost:3000',
+	'http://localhost:5174',
 	'https://guess-it-app.onrender.com',
+	'https://guess-it-1a80.onrender.com',
 ];
 app.use(cors({ origin: allowedOrigins }));
 
@@ -165,41 +168,41 @@ io.on('connection', (socket) => {
 		broadcastState();
 	});
 
-socket.on('submit_guess', ({ guess }) => {
-	if (gameState.status !== 'PLAYING') return;
+	socket.on('submit_guess', ({ guess }) => {
+		if (gameState.status !== 'PLAYING') return;
 
-	// NEW: Strict Input Validation - Prevent server crashes from null/objects
-	if (!guess || typeof guess !== 'string' || guess.trim() === '') {
-		return; // Just ignore invalid guesses silently
-	}
+		// NEW: Strict Input Validation - Prevent server crashes from null/objects
+		if (!guess || typeof guess !== 'string' || guess.trim() === '') {
+			return; // Just ignore invalid guesses silently
+		}
 
-	const player = gameState.players[socket.id];
-	if (!player || player.attempts <= 0) return;
+		const player = gameState.players[socket.id];
+		if (!player || player.attempts <= 0) return;
 
-	player.attempts -= 1;
+		player.attempts -= 1;
 
-	// Safely sanitize the guess
-	const safeGuess = guess.trim();
+		// Safely sanitize the guess
+		const safeGuess = guess.trim();
 
-	// Broadcast the safe guess to the chat
-	io.to('guessing_game').emit('new_chat', {
-		sender: player.username,
-		text: safeGuess,
-		isGM: false,
-		isSystem: false,
-	});
-
-	// Safely compare
-	if (safeGuess.toLowerCase() === gameState.answer) {
-		endRound(socket.id);
-	} else {
-		socket.emit('guess_result', {
-			correct: false,
-			attemptsLeft: player.attempts,
+		// Broadcast the safe guess to the chat
+		io.to('guessing_game').emit('new_chat', {
+			sender: player.username,
+			text: safeGuess,
+			isGM: false,
+			isSystem: false,
 		});
-		broadcastState();
-	}
-});
+
+		// Safely compare
+		if (safeGuess.toLowerCase() === gameState.answer) {
+			endRound(socket.id);
+		} else {
+			socket.emit('guess_result', {
+				correct: false,
+				attemptsLeft: player.attempts,
+			});
+			broadcastState();
+		}
+	});
 
 	socket.on('return_to_lobby', () => {
 		if (socket.id !== gameState.gameMaster) return;
