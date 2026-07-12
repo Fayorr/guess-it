@@ -21,8 +21,11 @@ type ChatMsg = {
 	isSystem: boolean;
 };
 
-// REMEMBER: Update this to your deployed backend URL when going live!
-const socket: Socket = io('https://guess-it-1a80.onrender.com', {
+// Backend URL (use Vite env or fallback to deployed host)
+const BACKEND_URL =
+	(import.meta as any).env?.VITE_BACKEND_URL ||
+	'https://guess-it-1a80.onrender.com';
+const socket: Socket = io(BACKEND_URL, {
 	autoConnect: false,
 });
 
