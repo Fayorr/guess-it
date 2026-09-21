@@ -4,7 +4,7 @@
     "lib": ["ES2023"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "types": ["node"],
+    "types": ["./.worker-types.d.ts", "node"],
     "strict": true,
     "noEmit": true,
     "noUncheckedIndexedAccess": true,
@@ -13,5 +13,5 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true
   },
-  "include": ["src", "worker-configuration.d.ts"]
+  "include": ["src"]
 }

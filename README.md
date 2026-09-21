@@ -16,7 +16,6 @@ Use two terminals.
 ```bash
 cd backend
 npm install
-npm run cf-typegen
 npm run dev
 ```
 
@@ -36,10 +35,13 @@ From `backend/`:
 
 ```bash
 npm install
-npm run cf-typegen
 npm run typecheck
 npm run deploy
 ```
+
+`npm run typecheck` regenerates the Worker declarations in the ignored
+`backend/.worker-types.d.ts` file before running TypeScript. Generated runtime
+types are therefore not committed to the repository.
 
 The first deployment creates the SQLite-backed `GameRoom` Durable Object class
 declared in `wrangler.jsonc`.

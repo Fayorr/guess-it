@@ -1,3 +1,4 @@
 node_modules
 .env
-.wrangler
+.wrangler/
+.worker-types.d.ts
