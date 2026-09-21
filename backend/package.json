@@ -1,22 +1,19 @@
 {
-  "name": "backend",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "guess-it-backend",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Cloudflare Worker and Durable Object backend for Guess It",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "dependencies": {
-    "cors": "^2.8.6",
-    "dotenv": "^17.4.1",
-    "express": "^5.2.1",
-    "socket.io": "^4.8.3"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "@types/node": "^24.12.2",
+    "typescript": "^6.0.2",
+    "wrangler": "^4.135.0"
   }
 }
