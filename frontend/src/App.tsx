@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 
 type Player = { id: string; username: string; score: number; attempts: number };
 type GameState = {
+	code: string | null;
 	status: 'LOBBY' | 'PLAYING' | 'ENDED';
 	gameMaster: string | null;
 	players: Record<string, Player>;
@@ -39,6 +40,7 @@ type ServerMessage =
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
 
 const initialGameState: GameState = {
+	code: null,
 	status: 'LOBBY',
 	gameMaster: null,
 	players: {},
@@ -67,6 +69,7 @@ function isPlayerMap(value: unknown): value is Record<string, Player> {
 function isGameState(value: unknown): value is GameState {
 	return (
 		isRecord(value) &&
+		(value.code === null || typeof value.code === 'string') &&
 		(value.status === 'LOBBY' ||
 			value.status === 'PLAYING' ||
 			value.status === 'ENDED') &&
@@ -166,37 +169,41 @@ function getSessionId(): string {
 	return sessionId;
 }
 
-function createWebSocketTarget(): { url: string | null; error: string | null } {
-	try {
-		const configuredBackend = import.meta.env.VITE_BACKEND_URL?.trim();
-		const baseUrl =
-			configuredBackend ||
-			(import.meta.env.DEV ? 'http://localhost:8787' : window.location.origin);
-		const url = new URL('/ws', baseUrl);
-		if (url.protocol === 'https:') url.protocol = 'wss:';
-		if (url.protocol === 'http:') url.protocol = 'ws:';
-		url.searchParams.set('room', import.meta.env.VITE_GAME_ROOM?.trim() || 'main');
-		url.searchParams.set('session', getSessionId());
-		return { url: url.toString(), error: null };
-	} catch {
-		return {
-			url: null,
-			error: 'The backend URL is invalid. Check VITE_BACKEND_URL.',
-		};
-	}
+function getBackendUrl(path: string): URL {
+	const configuredBackend = import.meta.env.VITE_BACKEND_URL?.trim();
+	const baseUrl =
+		configuredBackend ||
+		(import.meta.env.DEV ? 'http://localhost:8787' : window.location.origin);
+	return new URL(path, baseUrl);
+}
+
+function createWebSocketUrl(code: string): string {
+	const url = getBackendUrl('/ws');
+	if (url.protocol === 'https:') url.protocol = 'wss:';
+	if (url.protocol === 'http:') url.protocol = 'ws:';
+	url.searchParams.set('code', code);
+	url.searchParams.set('session', getSessionId());
+	return url.toString();
+}
+
+function isSessionCode(value: string): boolean {
+	return /^[A-HJ-NP-Z2-9]{6}$/.test(value);
 }
 
 export default function App() {
-	const [webSocketTarget] = useState(createWebSocketTarget);
 	const socketRef = useRef<WebSocket | null>(null);
 	const chatEndRef = useRef<HTMLDivElement>(null);
 	const [connectionStatus, setConnectionStatus] =
-		useState<ConnectionStatus>(webSocketTarget.url ? 'connecting' : 'disconnected');
+		useState<ConnectionStatus>('disconnected');
 	const [playerId, setPlayerId] = useState<string | null>(null);
 	const [username, setUsername] = useState('');
+	const [sessionCode, setSessionCode] = useState('');
+	const [codeInput, setCodeInput] = useState('');
 	const [hasJoined, setHasJoined] = useState(false);
 	const [joinPending, setJoinPending] = useState(false);
-	const [error, setError] = useState(webSocketTarget.error ?? '');
+	const [createPending, setCreatePending] = useState(false);
+	const [copyStatus, setCopyStatus] = useState('Copy');
+	const [error, setError] = useState('');
 	const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
 	const [gameState, setGameState] = useState<GameState>(initialGameState);
 	const [endData, setEndData] = useState<EndData | null>(null);
@@ -205,16 +212,49 @@ export default function App() {
 	const [guessInput, setGuessInput] = useState('');
 	const [clock, setClock] = useState(() => Date.now());
 
-	useEffect(() => {
-		if (!webSocketTarget.url) return;
-		const socket = new WebSocket(webSocketTarget.url);
+	const connectToSession = (
+		code: string,
+		joiningUsername: string,
+		createdByThisPlayer: boolean,
+	) => {
+		let socketUrl: string;
+		try {
+			socketUrl = createWebSocketUrl(code);
+		} catch {
+			setError('The backend URL is invalid. Check VITE_BACKEND_URL.');
+			setJoinPending(false);
+			setCreatePending(false);
+			return;
+		}
 
+		const previousSocket = socketRef.current;
+		const socket = new WebSocket(socketUrl);
+		let joined = false;
 		socketRef.current = socket;
+		previousSocket?.close(1000, 'Opening another session');
+		setConnectionStatus('connecting');
+		setSessionCode(code);
+		setHasJoined(false);
+		setPlayerId(null);
+		setGameState(initialGameState);
+		setChatMessages([]);
+		setEndData(null);
+
 		socket.addEventListener('open', () => {
+			if (socketRef.current !== socket) return;
 			setConnectionStatus('connected');
 			setError('');
+			if (!createdByThisPlayer) {
+				socket.send(
+					JSON.stringify({
+						type: 'join_session',
+						payload: { username: joiningUsername },
+					} satisfies ClientMessage),
+				);
+			}
 		});
 		socket.addEventListener('message', (event: MessageEvent<string>) => {
+			if (socketRef.current !== socket) return;
 			const message = parseServerMessage(event.data);
 			if (!message) return;
 
@@ -223,10 +263,12 @@ export default function App() {
 					setPlayerId(message.payload.playerId);
 					break;
 				case 'joined':
+					joined = true;
 					setPlayerId(message.payload.playerId);
 					setUsername(message.payload.username);
 					setHasJoined(true);
 					setJoinPending(false);
+					setCreatePending(false);
 					setError('');
 					break;
 				case 'state_update':
@@ -257,19 +299,29 @@ export default function App() {
 			}
 		});
 		socket.addEventListener('close', () => {
+			if (socketRef.current !== socket) return;
 			setConnectionStatus('disconnected');
 			setJoinPending(false);
-			setError('Connection to the game server was lost. Refresh to reconnect.');
+			setCreatePending(false);
+			if (!joined) {
+				setError('Session not found, closed, or unavailable. Check the code.');
+			} else {
+				setError('Connection to the game server was lost.');
+			}
 		});
 		socket.addEventListener('error', () => {
-			setError('Could not connect to the game server.');
+			if (socketRef.current !== socket) return;
+			setError('Could not connect. Check the session code and backend URL.');
 		});
+	};
 
+	useEffect(() => {
 		return () => {
+			const socket = socketRef.current;
 			socketRef.current = null;
-			socket.close(1000, 'Page closed');
+			socket?.close(1000, 'Page closed');
 		};
-	}, [webSocketTarget.url]);
+	}, []);
 
 	useEffect(() => {
 		chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -293,12 +345,73 @@ export default function App() {
 		return true;
 	};
 
+	const handleCreate = async (event: FormEvent) => {
+		event.preventDefault();
+		const safeUsername = username.trim();
+		if (!safeUsername) {
+			setError('Enter your name first.');
+			return;
+		}
+
+		setCreatePending(true);
+		setError('');
+		try {
+			const response = await fetch(getBackendUrl('/api/sessions'), {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					username: safeUsername,
+					sessionId: getSessionId(),
+				}),
+			});
+			const result: unknown = await response.json();
+			if (
+				!response.ok ||
+				!isRecord(result) ||
+				typeof result.code !== 'string' ||
+				!isSessionCode(result.code)
+			) {
+				const message =
+					isRecord(result) && typeof result.error === 'string'
+						? result.error
+						: 'Could not create a session.';
+				throw new Error(message);
+			}
+			connectToSession(result.code, safeUsername, true);
+		} catch (caughtError) {
+			setCreatePending(false);
+			setError(
+				caughtError instanceof Error
+					? caughtError.message
+					: 'Could not create a session.',
+			);
+		}
+	};
+
 	const handleJoin = (event: FormEvent) => {
 		event.preventDefault();
-		if (!username.trim()) return;
-		if (sendMessage({ type: 'join_session', payload: { username } })) {
-			setJoinPending(true);
-			setError('');
+		const safeUsername = username.trim();
+		const code = codeInput.trim().toUpperCase();
+		if (!safeUsername) {
+			setError('Enter your name first.');
+			return;
+		}
+		if (!isSessionCode(code)) {
+			setError('Enter a valid 6-character session code.');
+			return;
+		}
+		setJoinPending(true);
+		setError('');
+		connectToSession(code, safeUsername, false);
+	};
+
+	const copySessionCode = async () => {
+		try {
+			await navigator.clipboard.writeText(sessionCode);
+			setCopyStatus('Copied!');
+			window.setTimeout(() => setCopyStatus('Copy'), 1_500);
+		} catch {
+			setError('Could not copy the code. Select it and copy it manually.');
 		}
 	};
 
@@ -342,30 +455,92 @@ export default function App() {
 				style={{
 					padding: '2rem',
 					fontFamily: 'sans-serif',
-					maxWidth: '500px',
+					maxWidth: '520px',
 					margin: '0 auto',
 				}}
 			>
 				<h2>Live Guessing Game</h2>
-				<form onSubmit={handleJoin} style={{ display: 'flex', gap: '10px' }}>
+				<p style={{ margin: '8px 0 24px' }}>
+					Create a private session, or join one using the leader&apos;s code.
+				</p>
+				<label
+					htmlFor='username'
+					style={{ display: 'block', textAlign: 'left', marginBottom: '6px' }}
+				>
+					Your name
+				</label>
+				<input
+					id='username'
+					placeholder='Enter your name'
+					value={username}
+					onChange={(event) => setUsername(event.target.value)}
+					maxLength={20}
+					autoComplete='nickname'
+					style={{ padding: '0.8rem', width: '100%', boxSizing: 'border-box' }}
+				/>
+
+				<form onSubmit={handleCreate} style={{ marginTop: '18px' }}>
+					<button
+						type='submit'
+						disabled={createPending || joinPending}
+						style={{
+							padding: '0.9rem',
+							width: '100%',
+							background: '#b5952f',
+							color: 'white',
+							border: 0,
+							borderRadius: '6px',
+							fontWeight: 'bold',
+						}}
+					>
+						{createPending ? 'Creating session...' : 'Create private session'}
+					</button>
+				</form>
+
+				<div style={{ margin: '22px 0', borderTop: '1px solid #ddd' }} />
+				<form onSubmit={handleJoin}>
+					<label
+						htmlFor='session-code'
+						style={{ display: 'block', textAlign: 'left', marginBottom: '6px' }}
+					>
+						Session code
+					</label>
 					<input
-						placeholder='Enter your name'
-						value={username}
-						onChange={(event) => setUsername(event.target.value)}
-						maxLength={20}
-						style={{ padding: '0.8rem', flex: 1 }}
+						id='session-code'
+						placeholder='ABC234'
+						value={codeInput}
+						onChange={(event) =>
+							setCodeInput(
+								event.target.value
+									.toUpperCase()
+									.replace(/[^A-HJ-NP-Z2-9]/g, '')
+									.slice(0, 6),
+							)
+						}
+						maxLength={6}
+						autoComplete='off'
+						style={{
+							padding: '0.8rem',
+							width: '100%',
+							boxSizing: 'border-box',
+							textTransform: 'uppercase',
+							letterSpacing: '0.2em',
+							fontWeight: 'bold',
+						}}
 					/>
 					<button
 						type='submit'
-						disabled={connectionStatus !== 'connected' || joinPending}
-						style={{ padding: '0.8rem' }}
+						disabled={joinPending || createPending}
+						style={{ padding: '0.9rem', width: '100%', marginTop: '10px' }}
 					>
-						{joinPending ? 'Joining...' : 'Join'}
+						{joinPending ? 'Joining session...' : 'Join with code'}
 					</button>
 				</form>
-				<p style={{ marginTop: '12px', fontSize: '0.85rem' }}>
-					Server: {connectionStatus}
-				</p>
+				{connectionStatus !== 'disconnected' && (
+					<p style={{ marginTop: '12px', fontSize: '0.85rem' }}>
+						Server: {connectionStatus}
+					</p>
+				)}
 				{error && <p style={{ color: 'red', marginTop: '12px' }}>{error}</p>}
 			</div>
 		);
@@ -382,6 +557,28 @@ export default function App() {
 				}}
 			>
 				<h2>Lobby</h2>
+				<div
+					style={{
+						display: 'flex',
+						alignItems: 'center',
+						justifyContent: 'center',
+						gap: '10px',
+						margin: '12px 0 20px',
+					}}
+				>
+					<span>Session code:</span>
+					<strong style={{ fontSize: '1.35rem', letterSpacing: '0.16em' }}>
+						{sessionCode}
+					</strong>
+					<button type='button' onClick={copySessionCode}>
+						{copyStatus}
+					</button>
+				</div>
+				{isGM && (
+					<p style={{ marginBottom: '16px' }}>
+						Share this code only with the people you want in the game.
+					</p>
+				)}
 				<p>
 					Players: <strong>{playerCount}</strong> (Requires {'>'} 2)
 				</p>
@@ -499,6 +696,17 @@ export default function App() {
 			>
 				<h3 style={{ margin: 0, color: '#fff' }}>
 					{gameState.status === 'ENDED' ? 'Round Over' : 'Live Game'}
+					<small
+						style={{
+							display: 'block',
+							fontSize: '0.7rem',
+							letterSpacing: '0.12em',
+							marginTop: '4px',
+							color: '#ddd',
+						}}
+					>
+						SESSION {sessionCode}
+					</small>
 				</h3>
 				<h2
 					style={{

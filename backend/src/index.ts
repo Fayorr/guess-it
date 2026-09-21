@@ -1,8 +1,10 @@
 import { DurableObject } from 'cloudflare:workers';
 
 const ROUND_DURATION_MS = 60_000;
+const PENDING_SESSION_DURATION_MS = 10 * 60_000;
 const MAX_MESSAGE_BYTES = 4_096;
-const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const SESSION_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const SESSION_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{6}$/;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 
 type GameStatus = 'LOBBY' | 'PLAYING' | 'ENDED';
@@ -15,6 +17,8 @@ type Player = {
 };
 
 type StoredGameState = {
+	initialized: boolean;
+	code: string | null;
 	status: GameStatus;
 	gameMaster: string | null;
 	players: Record<string, Player>;
@@ -23,7 +27,7 @@ type StoredGameState = {
 	roundEndsAt: number | null;
 };
 
-type PublicGameState = Omit<StoredGameState, 'answer'>;
+type PublicGameState = Omit<StoredGameState, 'answer' | 'initialized'>;
 
 type ChatMessage = {
 	sender: string;
@@ -64,6 +68,8 @@ type ServerMessage =
 
 function emptyGameState(): StoredGameState {
 	return {
+		initialized: false,
+		code: null,
 		status: 'LOBBY',
 		gameMaster: null,
 		players: {},
@@ -91,6 +97,9 @@ function isStoredGameState(value: unknown): value is StoredGameState {
 	if (!isRecord(value) || !isRecord(value.players)) return false;
 
 	return (
+		typeof value.initialized === 'boolean' &&
+		(value.code === null ||
+			(typeof value.code === 'string' && SESSION_CODE_PATTERN.test(value.code))) &&
 		(value.status === 'LOBBY' ||
 			value.status === 'PLAYING' ||
 			value.status === 'ENDED') &&
@@ -168,6 +177,34 @@ function clonePlayers(
 	);
 }
 
+function createSessionCode(): string {
+	const random = new Uint8Array(6);
+	crypto.getRandomValues(random);
+	return Array.from(
+		random,
+		(value) => SESSION_CODE_ALPHABET[value & 31],
+	).join('');
+}
+
+function corsHeaders(): Record<string, string> {
+	return {
+		'Access-Control-Allow-Origin': '*',
+		'Access-Control-Allow-Methods': 'POST, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type',
+	};
+}
+
+function jsonResponse(
+	value: unknown,
+	init: ResponseInit = {},
+): Response {
+	const headers = new Headers(init.headers);
+	for (const [key, headerValue] of Object.entries(corsHeaders())) {
+		headers.set(key, headerValue);
+	}
+	return Response.json(value, { ...init, headers });
+}
+
 export class GameRoom extends DurableObject<Env> {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -185,6 +222,39 @@ export class GameRoom extends DurableObject<Env> {
 		});
 	}
 
+	async createSession(
+		code: string,
+		leaderSessionId: string,
+		username: string,
+	): Promise<boolean> {
+		if (
+			!SESSION_CODE_PATTERN.test(code) ||
+			!SESSION_ID_PATTERN.test(leaderSessionId)
+		) {
+			return false;
+		}
+
+		const safeUsername = username.trim().slice(0, 20);
+		if (!safeUsername) return false;
+
+		const current = this.readState();
+		if (current.initialized) return false;
+
+		const state = emptyGameState();
+		state.initialized = true;
+		state.code = code;
+		state.gameMaster = leaderSessionId;
+		state.players[leaderSessionId] = {
+			id: leaderSessionId,
+			username: safeUsername,
+			score: 0,
+			attempts: 3,
+		};
+		this.writeState(state);
+		await this.ctx.storage.setAlarm(Date.now() + PENDING_SESSION_DURATION_MS);
+		return true;
+	}
+
 	async fetch(request: Request): Promise<Response> {
 		if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
 			return new Response('Expected a WebSocket upgrade', { status: 426 });
@@ -200,6 +270,9 @@ export class GameRoom extends DurableObject<Env> {
 		const client = pair[0];
 		const server = pair[1];
 		const state = this.readState();
+		if (!state.initialized) {
+			return Response.json({ error: 'Session not found.' }, { status: 404 });
+		}
 		const existingPlayer = state.players[playerId];
 		const replacedConnections = this.ctx
 			.getWebSockets()
@@ -211,6 +284,9 @@ export class GameRoom extends DurableObject<Env> {
 
 		server.serializeAttachment(attachment);
 		this.ctx.acceptWebSocket(server);
+		if (state.status === 'LOBBY' && existingPlayer) {
+			await this.ctx.storage.deleteAlarm();
+		}
 		for (const replacedConnection of replacedConnections) {
 			replacedConnection.close(4001, 'Connected from another tab');
 		}
@@ -245,7 +321,11 @@ export class GameRoom extends DurableObject<Env> {
 		try {
 			switch (message.type) {
 				case 'join_session':
-					this.joinSession(webSocket, attachment, message.payload.username);
+					await this.joinSession(
+						webSocket,
+						attachment,
+						message.payload.username,
+					);
 					break;
 				case 'start_game':
 					await this.startGame(
@@ -292,6 +372,14 @@ export class GameRoom extends DurableObject<Env> {
 
 		const state = this.readState();
 		if (!state.players[attachment.playerId]) return;
+		const anotherConnectionExists = this.ctx
+			.getWebSockets()
+			.some((candidate) => candidate !== webSocket);
+		if (!anotherConnectionExists) {
+			this.writeState(emptyGameState());
+			await this.ctx.storage.deleteAlarm();
+			return;
+		}
 
 		delete state.players[attachment.playerId];
 		const remainingPlayerIds = Object.keys(state.players);
@@ -320,6 +408,14 @@ export class GameRoom extends DurableObject<Env> {
 
 	async alarm(): Promise<void> {
 		const state = this.readState();
+		if (
+			state.initialized &&
+			state.status === 'LOBBY' &&
+			this.ctx.getWebSockets().length === 0
+		) {
+			this.writeState(emptyGameState());
+			return;
+		}
 		if (state.status !== 'PLAYING' || state.roundEndsAt === null) return;
 
 		if (state.roundEndsAt > Date.now()) {
@@ -330,14 +426,19 @@ export class GameRoom extends DurableObject<Env> {
 		await this.endRound(state, null, false);
 	}
 
-	private joinSession(
+	private async joinSession(
 		webSocket: WebSocket,
 		attachment: SessionAttachment,
 		username: string,
-	): void {
+	): Promise<void> {
 		const state = this.readState();
+		if (!state.initialized) {
+			this.sendError(webSocket, 'Session not found.');
+			return;
+		}
 		const existingPlayer = state.players[attachment.playerId];
 		if (existingPlayer) {
+			await this.ctx.storage.deleteAlarm();
 			webSocket.serializeAttachment({
 				playerId: attachment.playerId,
 				username: existingPlayer.username,
@@ -358,6 +459,15 @@ export class GameRoom extends DurableObject<Env> {
 			return;
 		}
 
+		const leaderIsConnected = this.ctx.getWebSockets().some(
+			(candidate) =>
+				getAttachment(candidate)?.playerId === state.gameMaster,
+		);
+		if (!leaderIsConnected) {
+			this.sendError(webSocket, 'The session leader has not joined yet. Try again shortly.');
+			return;
+		}
+
 		const safeUsername = username.trim().slice(0, 20);
 		if (!safeUsername) {
 			this.sendError(webSocket, 'Invalid username.');
@@ -372,6 +482,7 @@ export class GameRoom extends DurableObject<Env> {
 		};
 		state.gameMaster ??= attachment.playerId;
 		this.writeState(state);
+		await this.ctx.storage.deleteAlarm();
 
 		webSocket.serializeAttachment({
 			playerId: attachment.playerId,
@@ -574,6 +685,7 @@ export class GameRoom extends DurableObject<Env> {
 
 	private toPublicState(state: StoredGameState): PublicGameState {
 		return {
+			code: state.code,
 			status: state.status,
 			gameMaster: state.gameMaster,
 			players: clonePlayers(state.players),
@@ -623,36 +735,98 @@ export class GameRoom extends DurableObject<Env> {
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
+		if (request.method === 'OPTIONS') {
+			return new Response(null, { status: 204, headers: corsHeaders() });
+		}
 
 		if (url.pathname === '/health') {
-			return Response.json({ status: 'ok' });
+			return jsonResponse({ status: 'ok' });
+		}
+
+		if (url.pathname === '/api/sessions') {
+			if (request.method !== 'POST') {
+				return jsonResponse({ error: 'Method not allowed.' }, { status: 405 });
+			}
+
+			const contentLength = Number(
+				request.headers.get('Content-Length') ?? '0',
+			);
+			if (contentLength > MAX_MESSAGE_BYTES) {
+				return jsonResponse(
+					{ error: 'Request body is too large.' },
+					{ status: 413 },
+				);
+			}
+
+			let body: unknown;
+			try {
+				const text = await request.text();
+				if (new TextEncoder().encode(text).byteLength > MAX_MESSAGE_BYTES) {
+					return jsonResponse(
+						{ error: 'Request body is too large.' },
+						{ status: 413 },
+					);
+				}
+				body = JSON.parse(text);
+			} catch {
+				return jsonResponse({ error: 'Invalid JSON body.' }, { status: 400 });
+			}
+
+			if (
+				!isRecord(body) ||
+				typeof body.username !== 'string' ||
+				typeof body.sessionId !== 'string' ||
+				!body.username.trim() ||
+				!SESSION_ID_PATTERN.test(body.sessionId)
+			) {
+				return jsonResponse(
+					{ error: 'A valid username and session ID are required.' },
+					{ status: 400 },
+				);
+			}
+
+			for (let attempt = 0; attempt < 8; attempt += 1) {
+				const code = createSessionCode();
+				const created = await env.GAME_ROOM.getByName(code).createSession(
+					code,
+					body.sessionId,
+					body.username,
+				);
+				if (created) return jsonResponse({ code }, { status: 201 });
+			}
+
+			return jsonResponse(
+				{ error: 'Could not create a unique session. Please try again.' },
+				{ status: 503 },
+			);
 		}
 
 		if (url.pathname !== '/ws') {
-			return Response.json(
+			return jsonResponse(
 				{
 					name: 'Guess It backend',
-					websocket: '/ws?room=main',
+					createSession: 'POST /api/sessions',
+					websocket: '/ws?code=ABC234',
 				},
 			);
 		}
 
-		const roomId = url.searchParams.get('room') ?? 'main';
-		if (!ROOM_ID_PATTERN.test(roomId)) {
-			return Response.json({ error: 'Invalid room ID.' }, { status: 400 });
+		const code = url.searchParams.get('code')?.toUpperCase() ?? '';
+		if (!SESSION_CODE_PATTERN.test(code)) {
+			return jsonResponse({ error: 'Invalid session code.' }, { status: 400 });
 		}
 
 		try {
-			return await env.GAME_ROOM.getByName(roomId).fetch(request);
+			return await env.GAME_ROOM.getByName(code).fetch(request);
 		} catch (error) {
 			console.error(
 				JSON.stringify({
 					message: 'Durable Object request failed',
-					roomId,
+					code,
 					error: error instanceof Error ? error.message : String(error),
 				}),
 			);
-			return Response.json(
+			return jsonResponse(
 				{ error: 'Game room is temporarily unavailable.' },
 				{ status: 503 },
 			);

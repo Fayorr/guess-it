@@ -56,7 +56,6 @@ Set these build-time variables on the frontend host:
 
 ```text
 VITE_BACKEND_URL=https://guess-it-backend.<your-workers-subdomain>.workers.dev
-VITE_GAME_ROOM=main
 ```
 
 Then build the Vite application:
@@ -74,7 +73,12 @@ the build output directory.
 
 - `GET /` — service information.
 - `GET /health` — health check.
-- `GET /ws?room=main` with `Upgrade: websocket` — game connection.
+- `POST /api/sessions` with `{ "username": "...", "sessionId": "..." }` —
+  create a private session and receive its six-character invite code.
+- `GET /ws?code=ABC234&session=...` with `Upgrade: websocket` — connect
+  to an existing private session.
 
-Room IDs may contain letters, numbers, underscores, and hyphens. Each room is
-routed to a separate Durable Object instance.
+The leader creates a session, shares its code, and is automatically assigned as
+the first Game Master. Unknown or closed codes are rejected. Each session is
+routed to a separate Durable Object instance and closes after its last connected
+participant leaves. An unclaimed session expires after ten minutes.
